@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Union
 
 import numpy as np
+from tqdm import tqdm
 import torch
 from ase.calculators.calculator import Calculator, all_changes
 from ase.stress import full_3x3_to_voigt_6_stress
@@ -18,6 +19,7 @@ from e3nn import o3
 
 from mace import data
 from mace.cli.convert_e3nn_cueq import run as run_e3nn_to_cueq
+from mace.cli.convert_e3nn_oeq import run as run_e3nn_to_oeq
 from mace.modules.utils import extract_invariant
 from mace.tools import torch_geometric, torch_tools, utils
 from mace.tools.compile import prepare
@@ -63,12 +65,24 @@ class MACECalculator(Calculator):
         compile_mode=None,
         fullgraph=True,
         enable_cueq=False,
+        enable_oeq=True,
+        batch_size=1,
         **kwargs,
     ):
         Calculator.__init__(self, **kwargs)
+        if enable_cueq and enable_oeq:
+            raise ValueError(
+                "Openeq and cueq cannot be enabled at the same time."
+            )
+
         if enable_cueq:
             assert model_type == "MACE", "CuEq only supports MACE models"
             compile_mode = None
+
+        if enable_oeq:
+            assert model_type == "MACE", "OpenEq only supports MACE models"
+            compile_mode = None
+        
         if "model_path" in kwargs:
             deprecation_message = (
                 "'model_path' argument is deprecated, please use 'model_paths'"
@@ -89,6 +103,7 @@ class MACECalculator(Calculator):
         self.results = {}
 
         self.model_type = model_type
+        self.batch_size = batch_size
 
         if model_type == "MACE":
             self.implemented_properties = [
@@ -135,10 +150,18 @@ class MACECalculator(Calculator):
                 torch.load(f=model_path, map_location=device)
                 for model_path in model_paths
             ]
+            
             if enable_cueq:
                 print("Converting models to CuEq for acceleration")
                 self.models = [
                     run_e3nn_to_cueq(model, device=device).to(device)
+                    for model in self.models
+                ]
+             
+            if enable_oeq:
+                print("Converting models to OEq for acceleration")
+                self.models = [
+                    run_e3nn_to_oeq(model, device=device).to(device)
                     for model in self.models
                 ]
 
@@ -259,6 +282,21 @@ class MACECalculator(Calculator):
         )
         batch = next(iter(data_loader)).to(self.device)
         return batch
+    
+    def _batch_data_loader(self, atoms_list):
+        configs = [data.config_from_atoms(atoms) for atoms in atoms_list]
+        data_loader = torch_geometric.dataloader.DataLoader(
+            dataset=[
+                data.AtomicData.from_config(
+                    config, z_table=self.z_table, cutoff=self.r_max, heads=self.heads
+                )
+                for config in configs
+            ],
+            batch_size=self.batch_size,
+            shuffle=False,
+            drop_last=False,
+        )
+        return data_loader
 
     def _clone_batch(self, batch):
         batch_clone = batch.clone()
@@ -433,3 +471,31 @@ class MACECalculator(Calculator):
         if self.num_models == 1:
             return descriptors[0]
         return descriptors
+
+    def batch_calculate(self, atoms_list=None, properties=None, system_changes=all_changes):
+        """
+        Calculate properties.
+        :param atoms: ase.Atoms object
+        :param properties: [str], properties to be computed, used by ASE internally
+        :param system_changes: [str], system changes since last calculation, used by ASE internally
+        :return:
+        """
+        # call to base-class to set atoms attribute
+        Calculator.calculate(self, atoms_list[0])
+
+        data_loader = self._batch_data_loader(atoms_list)
+
+        if self.model_type in ["MACE", "EnergyDipoleMACE"]:
+            compute_stress = not self.use_compile
+        else:
+            compute_stress = False
+
+        for i, model in enumerate(self.models):
+            for batch_base in tqdm(data_loader, desc="Inference", unit="batch"):
+                batch_base = batch_base.to(self.device)
+                batch = self._clone_batch(batch_base)
+                out = model(
+                    batch.to_dict(),
+                    compute_stress=compute_stress,
+                    training=self.use_compile,
+                )
