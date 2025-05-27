@@ -28,6 +28,12 @@ def run(
     torch.set_default_dtype(default_dtype)
     # Extract configuration
     config = extract_config_mace_model(source_model)
+
+    max_L = config["hidden_irreps"].lmax
+    correlation = config["correlation"]
+
+    print("max_L:%d, correlation:%d" % (max_L, correlation))
+
     config["oeq_config"] = {"enabled": True, "conv_fusion": "deterministic"}
 
     # Create new model with openequivariance config

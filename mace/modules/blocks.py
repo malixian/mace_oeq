@@ -37,6 +37,8 @@ from .radial import (
     SoftTransform,
 )
 
+import time
+
 
 @compile_mode("script")
 class LinearNodeEmbeddingBlock(torch.nn.Module):
@@ -289,6 +291,7 @@ class EquivariantProductBasisBlock(torch.nn.Module):
         sc: Optional[torch.Tensor],
         node_attrs: torch.Tensor,
     ) -> torch.Tensor:
+
         node_feats = self.symmetric_contractions(node_feats, node_attrs)
         if self.use_sc and sc is not None:
             return self.linear(node_feats) + sc
@@ -658,6 +661,7 @@ class RealAgnosticInteractionBlock(InteractionBlock):
 
         if not hasattr(self, "oeq_config"):
             self.oeq_config = None
+        self.oeq_config = None
         # First linear
         self.linear_up = Linear(
             self.node_feats_irreps,

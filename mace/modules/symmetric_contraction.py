@@ -16,7 +16,14 @@ from e3nn.util.jit import compile_mode
 
 from mace.tools.cg import U_matrix_real
 
-BATCH_EXAMPLE = 10
+import time
+
+from torch.utils.dlpack import to_dlpack
+
+import matplotlib.pyplot as plt
+from scipy.sparse import random
+
+BATCH_EXAMPLE = 5888
 ALPHABET = ["w", "x", "v", "n", "z", "r", "t", "y", "u", "o", "p", "s"]
 
 
@@ -108,6 +115,12 @@ class Contraction(torch.nn.Module):
                 dtype=dtype,
             )[-1]
             self.register_buffer(f"U_matrix_{nu}", U_matrix)
+            if nu == 2:
+                for i in range(4):
+                    print("correlation=%d, i=%d" % (nu,i))
+                    print(U_matrix[:,:,i])
+                    self.draw_tensor(U_matrix[:,:,i], "CG_Matrix_"+str(i))
+
 
         # Tensor contraction equations
         self.contractions_weighting = torch.nn.ModuleList()
@@ -122,6 +135,8 @@ class Contraction(torch.nn.Module):
             num_equivariance = 2 * irrep_out.lmax + 1
             num_ell = self.U_tensors(i).size()[-2]
 
+            print("cuEq Contraction irrep_out.lmax:%d, num_equivariance:%d " % (irrep_out.lmax,  num_equivariance))
+            
             if i == correlation:
                 parse_subscript_main = (
                     [ALPHABET[j] for j in range(i + min(irrep_out.lmax, 1) - 1)]
@@ -133,6 +148,8 @@ class Contraction(torch.nn.Module):
                         "".join(parse_subscript_main), x, y, w, z
                     )
                 )
+
+                print("========== einsum contract main %s ==========", "".join(parse_subscript_main))
 
                 # Optimizing the contractions
                 self.graph_opt_main = opt_einsum_fx.optimize_einsums_full(
@@ -146,6 +163,8 @@ class Contraction(torch.nn.Module):
                         torch.randn((BATCH_EXAMPLE, num_elements)),
                     ),
                 )
+                
+
                 # Parameters for the product basis
                 w = torch.nn.Parameter(
                     torch.randn((num_elements, num_params, self.num_features))
@@ -176,6 +195,9 @@ class Contraction(torch.nn.Module):
                     lambda x, y: torch.einsum("".join(parse_subscript_features), x, y)
                 )
 
+                print("========== einsum contract weighting %s ==========", "".join(parse_subscript_weighting))
+                print("========== einsum contract features %s ==========", "".join(parse_subscript_features))
+
                 # Optimizing the contractions
                 graph_opt_weighting = opt_einsum_fx.optimize_einsums_full(
                     model=graph_module_weighting,
@@ -197,6 +219,7 @@ class Contraction(torch.nn.Module):
                         torch.randn((BATCH_EXAMPLE, self.num_features, num_ell)),
                     ),
                 )
+
                 self.contractions_weighting.append(graph_opt_weighting)
                 self.contractions_features.append(graph_opt_features)
                 # Parameters for the product basis
@@ -209,23 +232,179 @@ class Contraction(torch.nn.Module):
             self.weights = weights[:-1]
             self.weights_max = weights[-1]
 
+    def stats_nonzero(self, tensor: torch.Tensor):
+        nonzero_count = torch.count_nonzero(tensor)
+        total_elements = tensor.numel()  # 或 tensor.size().numel()
+        nonzero_ratio = nonzero_count / total_elements
+        return nonzero_ratio
+
+    def check_sparsity(self, sparse_tensor):
+        nnz = torch.count_nonzero(sparse_tensor)
+        total = sparse_tensor.numel()
+        sparsity = 1 - (nnz / total)
+        print(f"Sparsity: {sparsity:.2%} (nnz={nnz}, total={total})")
+    
+    '''
+    def gen_sparse_matrix(self, dense_tensor):
+        dense_cupy = cupy.fromDlpack(to_dlpack(dense_tensor))
+        csr_matrix = cupyx.scipy.sparse.csr_matrix(dense_cupy)
+        csr_matrix.sum_duplicates()
+        csr_matrix.sort_indices()
+        csr_matrix.has_canonical_format = True
+        return csr_matrix
+    '''
+
+    def draw_tensor(self, sparse_matrix, name):
+        plt.figure(figsize=(10, 10))
+        plt.spy(sparse_matrix.cpu(), markersize=5)
+        plt.title("Sparse Matrix Visualization")
+        plt.savefig(name+'.png')  # 默认保存为PNG格式
+        plt.close()  # 关闭图形，释放内存
+
+    def use_spmm(self, x, y):
+            # 1. 构建稀疏张量 [a, b, e, f, d]（COO 格式）
+        a, b, e, f, d = y.shape
+        a, b, d = x.shape
+        sparse_5d = y.to_sparse_coo()
+        indices = sparse_5d.indices()  # (5, nnz)
+        values = sparse_5d.values()    # (nnz,)
+
+        # 计算新的 2D 索引 [a*b*e*f, d]
+        i, j, k, l, m = indices
+        new_row = i * (b * e * f) + j * (e * f) + k * f + l
+        new_col = m
+        sparse_2d = torch.sparse_coo_tensor(
+            torch.stack([new_row, new_col]),
+            values,
+            size=(a * b * e * f, d),
+        ).coalesce().to_sparse_csr()
+
+        # 2. 调整稠密张量 [a, b, d] -> [d, a*b]
+        dense_3d = x
+        dense_2d = dense_3d.reshape(a * b, d).T  # [a*b, d] -> [d, a*b]
+
+        torch.cuda.synchronize()
+        start_time = time.perf_counter() * 1000
+        # 3. 执行 SpMM: [a*b*e*f, d] @ [d, a*b] -> [a*b*e*f, a*b]
+        result = torch.sparse.mm(sparse_2d, dense_2d)
+        torch.cuda.synchronize()
+        end_time = time.perf_counter() * 1000
+        execution_time_ms = end_time - start_time
+        print(f"========= spmm only compute cost: {execution_time_ms:.3f} ms ========")
+        # 4. 恢复形状（可选）
+        final_result = result.reshape(a, b, e, f)
+        print(final_result.shape)
+
+    def diag_weight_einsum(self, A_tensor, B_tensor):
+        W,X,K = A_tensor.shape
+        B,K,C = B_tensor.shape
+        A_diag = torch.stack([torch.diagonal(A_tensor[:, :, k]) for k in range(K)], dim=0)  # [K, W]
+
+        torch.cuda.synchronize()
+        C_diag = torch.einsum("kw,bkc->bcw", A_diag, B_tensor)  # [B, C, W]
+        
+        device = "cuda"
+        # 构造全输出张量并写入对角
+        C_opt = torch.zeros((B, C, W, X), device=device)
+        w_idx = torch.arange(W, device=device)
+        C_opt[:, :, w_idx, w_idx] = C_diag
+        return C_opt
+
+    def manual_weight_compute(self, A_tensor, B_tensor):
+        device = "cuda"
+        W,X,K = A_tensor.shape
+        B,K,C = B_tensor.shape
+        A_diag = torch.stack([torch.diagonal(A_tensor[:, :, k]) for k in range(K)], dim=0)  # [K, W]
+        nonzero_map = {
+            0: [0],
+            1: [1, 2, 3],
+            2: [4, 5, 6, 7, 8],
+            3: [9, 10, 11, 12, 13, 14]
+        }
+
+        C_manual = torch.zeros(B, C, W, device=device)
+        for k, ws in nonzero_map.items():
+            for w in ws:
+                C_manual[:, :, w] += A_diag[k, w] * B_tensor[:, k, :]
+
+        # 构造最终输出（对角填值）
+        C_manual_full = torch.zeros(B, C, W, X, device=device)
+        idx = torch.arange(W, device=device)
+        C_manual_full[:, :, idx, idx] = C_manual
+        return C_manual_full
+
     def forward(self, x: torch.Tensor, y: torch.Tensor):
+        torch.cuda.synchronize()
+        start_time = time.perf_counter() * 1000
+        
+        '''
         out = self.graph_opt_main(
             self.U_tensors(self.correlation),
             self.weights_max,
             x,
             y,
         )
+        '''
+        torch.cuda.synchronize()
+        start_time = time.perf_counter() * 1000
+        uw = torch.functional.tensordot(self.weights_max, self.U_tensors(self.correlation), dims = ((1,), (3,)), out = None)
+        
+        y_idx = torch.argmax(y, dim=1)
+        uw_selected = uw[y_idx]
+        print("uw_selected shape:", uw_selected.shape)
+        self.check_sparsity(uw_selected)
+        print("x shape:", x.shape)
+        #self.draw_tensor(uw_selected)
+        out = torch.einsum('abd, abefd->abef', x, uw_selected)
+        #out = self.use_spmm(x, uw_selected)
+        torch.cuda.synchronize()
+        end_time = time.perf_counter() * 1000
+        execution_time_ms = end_time - start_time
+        print(f"========= total contract_main compute cost: {execution_time_ms:.3f} ms ========")        
+
         for i, (weight, contract_weights, contract_features) in enumerate(
             zip(self.weights, self.contractions_weighting, self.contractions_features)
         ):
+            torch.cuda.synchronize()
+            
+            start_time = time.perf_counter() * 1000
+            '''
             c_tensor = contract_weights(
                 self.U_tensors(self.correlation - i - 1),
                 weight,
                 y,
             )
+            '''
+
+
+            if i == 0:
+                w_selected = weight[y_idx]
+                c_tensor = self.diag_weight_einsum(self.U_tensors(self.correlation - i - 1), w_selected)
+                #c_tensor = self.manual_weight_compute(self.U_tensors(self.correlation - i - 1), w_selected)
+            else:
+                c_tensor = contract_weights(
+                    self.U_tensors(self.correlation - i - 1),
+                    weight,
+                    y,
+                )
+             
+            
+            torch.cuda.synchronize()
+            end_time = time.perf_counter() * 1000
+            execution_time_ms = end_time - start_time
+            print(f"========= contract_weight cost: {execution_time_ms:.3f} ms ========")
+            print(self.U_tensors(self.correlation - i - 1).shape)
+            print(weight.shape)
+            print(y.shape)
             c_tensor = c_tensor + out
+
+            start_time = time.perf_counter() * 1000
             out = contract_features(c_tensor, x)
+            print("x shape:", x.shape)
+            torch.cuda.synchronize()
+            end_time = time.perf_counter() * 1000
+            execution_time_ms = end_time - start_time
+            print(f"========= contract_features cost: {execution_time_ms:.3f} ms ========")
 
         return out.view(out.shape[0], -1)
 

@@ -299,14 +299,16 @@ class SymmetricContractionWrapper:
 
             instance.forward = types.MethodType(cuet_forward, instance)
             return instance
+        '''
         elif oeq_config is not None and oeq_config["enabled"]:
+            print("====================== enable oeq STP ==================")
             from openequivariance.implementations.symmetric_contraction.STPOpt import SymmetricContraction as OEQ_STP
             return OEQ_STP(
                 irreps_in=irreps_in,
                 irreps_out=irreps_out,
                 correlation=correlation,
                 num_elements=num_elements)
-
+        '''
         return SymmetricContraction(
             irreps_in=irreps_in,
             irreps_out=irreps_out,

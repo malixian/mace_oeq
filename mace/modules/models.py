@@ -15,6 +15,8 @@ from mace.data import AtomicData
 from mace.modules.radial import ZBLBasis
 from mace.tools.scatter import scatter_sum
 
+import time
+
 from .blocks import (
     AtomicEnergiesBlock,
     EquivariantProductBasisBlock,
@@ -75,6 +77,10 @@ class MACE(torch.nn.Module):
         self.register_buffer(
             "num_interactions", torch.tensor(num_interactions, dtype=torch.int64)
         )
+        
+        print("atomic numbers size:", len(atomic_numbers))
+        print("atomic numbers:", atomic_numbers)
+        print("max_ell:%d, r_max:%d, num_interactions:%d" % (max_ell, r_max, num_interactions))
         if heads is None:
             heads = ["default"]
         self.heads = heads
@@ -384,6 +390,9 @@ class ScaleShiftMACE(MACE):
                 num_graphs=num_graphs,
                 batch=data["batch"],
             )
+        
+        torch.cuda.synchronize()
+        forward_start_time = time.perf_counter() * 1000
 
         # Atomic energies
         node_e0 = self.atomic_energies_fn(data["node_attrs"])[
@@ -392,7 +401,9 @@ class ScaleShiftMACE(MACE):
         e0 = scatter_sum(
             src=node_e0, index=data["batch"], dim=0, dim_size=num_graphs
         )  # [n_graphs, num_heads]
-
+        
+        torch.cuda.synchronize()
+        start_time = time.perf_counter() * 1000
         # Embeddings
         node_feats = self.node_embedding(data["node_attrs"])
         vectors, lengths = get_edge_vectors_and_lengths(
@@ -410,12 +421,20 @@ class ScaleShiftMACE(MACE):
             )
         else:
             pair_node_energy = torch.zeros_like(node_e0)
+        
+        torch.cuda.synchronize()
+        end_time = time.perf_counter() * 1000
+        execution_time_ms = end_time - start_time
+        print(f"========= embedding cost: {execution_time_ms:.3f} ms ========")
+
+        start_time = time.perf_counter() * 1000
         # Interactions
         node_es_list = [pair_node_energy]
         node_feats_list = []
         for interaction, product, readout in zip(
             self.interactions, self.products, self.readouts
         ):
+            start_time = time.perf_counter() * 1000
             node_feats, sc = interaction(
                 node_attrs=data["node_attrs"],
                 node_feats=node_feats,
@@ -423,14 +442,37 @@ class ScaleShiftMACE(MACE):
                 edge_feats=edge_feats,
                 edge_index=data["edge_index"],
             )
+            torch.cuda.synchronize()
+            end_time = time.perf_counter() * 1000
+            execution_time_ms = end_time - start_time
+            print(f"========= interaction cost: {execution_time_ms:.3f} ms ========") 
+            
+            start_time = time.perf_counter() * 1000
             node_feats = product(
                 node_feats=node_feats, sc=sc, node_attrs=data["node_attrs"]
             )
+            torch.cuda.synchronize()
+            end_time = time.perf_counter() * 1000
+            execution_time_ms = end_time - start_time
+            print(f"========= product cost: {execution_time_ms:.3f} ms ========")
+
+            start_time = time.perf_counter() * 1000
             node_feats_list.append(node_feats)
             node_es_list.append(
                 readout(node_feats, node_heads)[num_atoms_arange, node_heads]
             )  # {[n_nodes, ], }
+            torch.cuda.synchronize()
+            end_time = time.perf_counter() * 1000
+            execution_time_ms = end_time - start_time
+            print(f"========= readout cost: {execution_time_ms:.3f} ms ========")
+        
+        torch.cuda.synchronize()
+        forward_end_time = time.perf_counter() * 1000
+        execution_time_ms = forward_end_time - forward_start_time
+        print(f"========= forward cost: {execution_time_ms:.3f} ms ========")
+        
 
+        start_time = time.perf_counter() * 1000
         # Concatenate node features
         node_feats_out = torch.cat(node_feats_list, dim=-1)
         # Sum over interactions
@@ -443,8 +485,13 @@ class ScaleShiftMACE(MACE):
         inter_e = scatter_sum(
             src=node_inter_es, index=data["batch"], dim=-1, dim_size=num_graphs
         )  # [n_graphs,]
+        torch.cuda.synchronize()
+        end_time = time.perf_counter() * 1000
+        execution_time_ms = end_time - start_time
+        print(f"========= sum over nodes in graph cost: {execution_time_ms:.3f} ms ========")
 
         # Add E_0 and (scaled) interaction energy
+        start_time = time.perf_counter() * 1000
         total_energy = e0 + inter_e
         node_energy = node_e0 + node_inter_es
         forces, virials, stress, hessian = get_outputs(
@@ -458,6 +505,11 @@ class ScaleShiftMACE(MACE):
             compute_stress=compute_stress,
             compute_hessian=compute_hessian,
         )
+        torch.cuda.synchronize()        
+        end_time = time.perf_counter() * 1000
+        execution_time_ms = end_time - start_time
+        print(f"========= backward cost: {execution_time_ms:.3f} ms ========")
+
         output = {
             "energy": total_energy,
             "node_energy": node_energy,
