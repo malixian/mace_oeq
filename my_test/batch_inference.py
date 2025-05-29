@@ -29,33 +29,36 @@ for file in tqdm(os.listdir(data_path), desc="Reading files", unit="file"):
         atoms_list.append(ase.io.read(os.path.join(data_path, file), index=0)) 
 
 
-
-activities = [ProfilerActivity.CPU, ProfilerActivity.CUDA]
-sort_by_keyword = "self_" + device + "_time_total"
-
 '''
+activities = [ProfilerActivity.CUDA, ProfilerActivity.CPU]
+sort_by_keyword = "self_" + device + "_time_total"
 #warmup
 for step in range(0, 5):
     calculator.batch_calculate(atoms_list=atoms_list)
 
-with profile(activities=activities, record_shapes=True, with_stack=True) as prof:
+with profile(activities=activities, with_modules=True, with_stack=True) as prof:
     calculator.batch_calculate(atoms_list=atoms_list)
-print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
-print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=10))
-print(prof.key_averages(group_by_stack_n=5).table(sort_by=sort_by_keyword, row_limit=10))
+print(prof.key_averages(group_by_stack_n=5).table(sort_by="cuda_time_total", row_limit=10))
 
 
-prof.export_chrome_trace("openeq-trace.json")
+prof.export_chrome_trace("e3nn-oeq-trace.json")
 '''
 
 
+'''
 with torch.profiler.profile(
+        activities = [ProfilerActivity.CUDA],
         schedule=torch.profiler.schedule(wait=2, warmup=2, active=3, repeat=3),
         on_trace_ready=torch.profiler.tensorboard_trace_handler('./log/mace'),
-        record_shapes=True,
-        profile_memory=True,
-        with_stack=True
+        #record_shapes=True,
+        #profile_memory=True,
+        with_modules=True,
 ) as prof:
     for step in range(0, 10):
         prof.step()  # Need to call this at each step to notify profiler of steps' boundary.
         calculator.batch_calculate(atoms_list=atoms_list)
+'''
+
+for i in range(0, 5):
+    print("<<<<<<<<<<<<<<<<<<<<<<<<<< warmup %d >>>>>>>>>>>>>>>>>>>>>>" % i)
+    calculator.batch_calculate(atoms_list=atoms_list)

@@ -115,12 +115,6 @@ class Contraction(torch.nn.Module):
                 dtype=dtype,
             )[-1]
             self.register_buffer(f"U_matrix_{nu}", U_matrix)
-            if nu == 2:
-                for i in range(4):
-                    print("correlation=%d, i=%d" % (nu,i))
-                    print(U_matrix[:,:,i])
-                    self.draw_tensor(U_matrix[:,:,i], "CG_Matrix_"+str(i))
-
 
         # Tensor contraction equations
         self.contractions_weighting = torch.nn.ModuleList()
@@ -261,6 +255,16 @@ class Contraction(torch.nn.Module):
         plt.savefig(name+'.png')  # 默认保存为PNG格式
         plt.close()  # 关闭图形，释放内存
 
+    def draw_2d_tensor(self, tensor, name):
+        merge = torch.zeros(16,16,device="cuda")
+        for tid in range(tensor.shape[-1]):
+            merge += tensor[:,:,tid]
+        plt.figure(figsize=(10, 10))
+        plt.spy(merge.cpu(), markersize=5)
+        plt.title("Sparse Matrix Visualization")
+        plt.savefig(name+'.png')  # 默认保存为PNG格式
+        plt.close()  # 关闭图形，释放内存
+
     def use_spmm(self, x, y):
             # 1. 构建稀疏张量 [a, b, e, f, d]（COO 格式）
         a, b, e, f, d = y.shape
@@ -319,36 +323,88 @@ class Contraction(torch.nn.Module):
             0: [0],
             1: [1, 2, 3],
             2: [4, 5, 6, 7, 8],
-            3: [9, 10, 11, 12, 13, 14]
+            3: [9, 10, 11, 12, 13, 14,15]
         }
 
-        C_manual = torch.zeros(B, C, W, device=device)
+        C_manual_full = torch.zeros(B, C, W, X, device=device)
         for k, ws in nonzero_map.items():
             for w in ws:
-                C_manual[:, :, w] += A_diag[k, w] * B_tensor[:, k, :]
+                #C_manual_full[:, :, w, w] += A_diag[k, w] * B_tensor[:, k, :]
+                 C_manual_full[:, :, w, w] += A_tensor[w, w, k] * B_tensor[:, k, :]
 
-        # 构造最终输出（对角填值）
-        C_manual_full = torch.zeros(B, C, W, X, device=device)
-        idx = torch.arange(W, device=device)
-        C_manual_full[:, :, idx, idx] = C_manual
         return C_manual_full
+
+    
+    def draw_tensor_3d(self, tensor: torch.Tensor, name: str):
+        
+        merge_tensor = torch.zeros(16,16,16, device="cuda")
+        for tid in range(0, tensor.shape[-1]):
+            merge_tensor += tensor[:,:,:,tid]
+        
+        nonzero = torch.nonzero(merge_tensor).cpu().numpy()
+        
+        
+        fig, axes = plt.subplots(4, 4, figsize=(12, 12))
+
+        x_idx = 0
+        yz_proj = torch.zeros(16, 16)
+        for nonele in nonzero:
+            if nonele[0] == x_idx:
+                yz_proj[nonele[1], nonele[2]] = 1
+            else:
+                axes[x_idx/4, x_idx%4].imshow(yz_proj.numpy(), cmap='Greys')
+                axes[x_idx/4, x_idx%4].set_title('YZ merge (non-zero)')
+                axes[x_idx/4, x_idx%4].set_xlabel('Z')
+                axes[x_idx/4, x_idx%4].set_ylabel('Y')
+                yz_proj = torch.zeros(16, 16)
+                x_idx = nonele[0]
+                    
+        plt.tight_layout()
+        plt.savefig(str(name) + '.png', dpi=300)
+        # draw 3d tensor
+        '''
+        fig = plt.figure(figsize=(10, 8))
+        ax = fig.add_subplot(111, projection='3d')
+
+        # 绘制非零元素
+        if len(nonzero_indices) > 0:
+            x, y, z = nonzero_indices.T
+            ax.scatter(x, y, z, c='r', marker='o', s=20, alpha=0.6, label='Non-zero elements')
+
+        ax.set_xlabel('X (Dim 1)')
+        ax.set_ylabel('Y (Dim 2)')
+        ax.set_zlabel('Z (Dim 3)')
+        ax.set_title('3D Tensor Non-Zero Elements Distribution')
+        ax.legend()
+        plt.savefig(str(name) + '.png', dpi=300)
+        '''
+
+    def print_nonzero_index(self, tensor: torch.Tensor):
+        tensor_num = tensor.shape[-1]
+        for i in range(0, tensor_num):
+            tensor_i = tensor[:,:,:,i]
+            print("<< tensor idx:%d >>" % i)
+            nonzero_indices = torch.nonzero(tensor_i)
+            for idx in nonzero_indices:
+                print(idx.tolist(), tensor_i[idx[0], idx[1], idx[2]])
 
     def forward(self, x: torch.Tensor, y: torch.Tensor):
         torch.cuda.synchronize()
         start_time = time.perf_counter() * 1000
         
-        '''
+        
         out = self.graph_opt_main(
             self.U_tensors(self.correlation),
             self.weights_max,
             x,
             y,
         )
-        '''
-        torch.cuda.synchronize()
-        start_time = time.perf_counter() * 1000
-        uw = torch.functional.tensordot(self.weights_max, self.U_tensors(self.correlation), dims = ((1,), (3,)), out = None)
+        print("contract main out shape:", out.shape)
         
+        #self.draw_tensor_3d(self.U_tensors(self.correlation), "cg3d")
+        #self.print_nonzero_index(self.U_tensors(self.correlation))
+        ''' 
+        uw = torch.functional.tensordot(self.weights_max, self.U_tensors(self.correlation), dims = ((1,), (3,)), out = None) 
         y_idx = torch.argmax(y, dim=1)
         uw_selected = uw[y_idx]
         print("uw_selected shape:", uw_selected.shape)
@@ -357,6 +413,9 @@ class Contraction(torch.nn.Module):
         #self.draw_tensor(uw_selected)
         out = torch.einsum('abd, abefd->abef', x, uw_selected)
         #out = self.use_spmm(x, uw_selected)
+        '''
+        y_idx = torch.argmax(y, dim=1)
+
         torch.cuda.synchronize()
         end_time = time.perf_counter() * 1000
         execution_time_ms = end_time - start_time
@@ -368,44 +427,73 @@ class Contraction(torch.nn.Module):
             torch.cuda.synchronize()
             
             start_time = time.perf_counter() * 1000
-            '''
+            
             c_tensor = contract_weights(
                 self.U_tensors(self.correlation - i - 1),
                 weight,
                 y,
             )
-            '''
 
 
             if i == 0:
+                torch.cuda.synchronize()
+                start_time = time.perf_counter() * 1000
                 w_selected = weight[y_idx]
-                c_tensor = self.diag_weight_einsum(self.U_tensors(self.correlation - i - 1), w_selected)
-                #c_tensor = self.manual_weight_compute(self.U_tensors(self.correlation - i - 1), w_selected)
+                #c_tensor = self.diag_weight_einsum(self.U_tensors(self.correlation - i - 1), w_selected)
+                c_tensor = self.manual_weight_compute(self.U_tensors(self.correlation - i - 1), w_selected)
+                torch.cuda.synchronize()
+                end_time = time.perf_counter() * 1000
+                execution_time_ms = end_time - start_time
+                print(f"========= my contract_weight cost: {execution_time_ms:.3f} ms ========")
+                
+                #c_tensor = c_tensor + out
+                start_time = time.perf_counter() * 1000
+                idx = torch.arange(c_tensor.shape[-1], device="cuda")
+                c_diag = c_tensor[:, :, idx, idx]  # [N, C, W]
+                out_diag = out[:, :, idx, idx]
+                diag_sum = c_diag + out_diag
+                out[:, :, idx, idx] = diag_sum
+                torch.cuda.synchronize()
+                end_time = time.perf_counter() * 1000
+                execution_time_ms = end_time - start_time
+                print(f"========= my tensor add cost: {execution_time_ms:.3f} ms ========")
+
+                start_time = time.perf_counter() * 1000
+                c_diag = c_tensor.diagonal(offset=0, dim1=2, dim2=3)  # [N, C, W]
+                out = c_diag * x
+                torch.cuda.synchronize()
+                end_time = time.perf_counter() * 1000
+                execution_time_ms = end_time - start_time
+                print(f"========= my contract_features cost: {execution_time_ms:.3f} ms ========")
+
             else:
+                start_time = time.perf_counter() * 1000
                 c_tensor = contract_weights(
                     self.U_tensors(self.correlation - i - 1),
                     weight,
                     y,
                 )
-             
-            
-            torch.cuda.synchronize()
-            end_time = time.perf_counter() * 1000
-            execution_time_ms = end_time - start_time
-            print(f"========= contract_weight cost: {execution_time_ms:.3f} ms ========")
-            print(self.U_tensors(self.correlation - i - 1).shape)
-            print(weight.shape)
-            print(y.shape)
-            c_tensor = c_tensor + out
+                
+                torch.cuda.synchronize()
+                end_time = time.perf_counter() * 1000
+                execution_time_ms = end_time - start_time
+                print(f"========= contract_weight cost: {execution_time_ms:.3f} ms ========")
+                
+                start_time = time.perf_counter() * 1000
+                c_tensor = c_tensor + out
+                print("contract weight out shape:", c_tensor.shape)
+                torch.cuda.synchronize()
+                end_time = time.perf_counter() * 1000
+                execution_time_ms = end_time - start_time
+                print(f"========= tensor add cost: {execution_time_ms:.3f} ms ========")
 
-            start_time = time.perf_counter() * 1000
-            out = contract_features(c_tensor, x)
-            print("x shape:", x.shape)
-            torch.cuda.synchronize()
-            end_time = time.perf_counter() * 1000
-            execution_time_ms = end_time - start_time
-            print(f"========= contract_features cost: {execution_time_ms:.3f} ms ========")
-
+                start_time = time.perf_counter() * 1000
+                out = contract_features(c_tensor, x)
+                torch.cuda.synchronize()
+                end_time = time.perf_counter() * 1000
+                execution_time_ms = end_time - start_time
+                print(f"========= contract_features cost: {execution_time_ms:.3f} ms ========")
+                print("contract feature out shape:", out.shape)
         return out.view(out.shape[0], -1)
 
     def U_tensors(self, nu: int):
