@@ -26,7 +26,6 @@ __global__ void sparse_scatter_kernel(
     double b_val = B[i * B1 * B2 + j * B2 + i3];
 
     // output shape: [B0, B1, 16, 16, 16]
-    // 索引计算
     int out_idx = i * B1 * 16 * 16 * 16 + j * 16 * 16 * 16 + i0 * 16 * 16 + i1 * 16 + i2;
 
     atomicAdd(&output[out_idx], a_val * b_val);
