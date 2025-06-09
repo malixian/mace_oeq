@@ -20,8 +20,8 @@ sparse_kernel = load(
 )
 
 sparse_kernel_opt = load(
-    name="sparse_kernel_opt",
-    sources=["sparse_kernel_opt2.cu"],
+    name="sparse_kernel_v3",
+    sources=["sparse_kernel_v3.cu"],
     verbose=True,
     extra_cuda_cflags=[
         "-gencode=arch=compute_90,code=sm_90"
@@ -49,10 +49,11 @@ out_sparse_cuda = torch.zeros(5152, 96, 16, 16, 16, dtype=torch.float64, device=
 
 retry = 1
 
-# 调用 CUDA kernel
+# 调用 CUDA kernel baseline
 torch.cuda.synchronize()
 start_time = time.perf_counter() * 1000
 
+'''
 for i in range(0, retry):
     sparse_kernel.sparse_scatter_mul_add(
         indices.int(), values, B, out_sparse_cuda
@@ -62,14 +63,14 @@ torch.cuda.synchronize()
 end_time = time.perf_counter() * 1000
 execution_time_ms = (end_time - start_time) / retry
 print(f"CUDA kernel 时间: {execution_time_ms:.3f} ms")
-
-
 '''
+
+# Optimized CUDA kernel
 torch.cuda.synchronize()
 start_time = time.perf_counter() * 1000
 
 for i in range(0, retry):
-    sparse_kernel_opt.sparse_scatter_mul_add_optimized(
+    sparse_kernel_opt.sparse_scatter_mul_add_v3(
         indices.int(), values, B, out_sparse_cuda
     )
 
@@ -77,7 +78,7 @@ torch.cuda.synchronize()
 end_time = time.perf_counter() * 1000
 execution_time_ms = (end_time - start_time) / retry
 print(f"Opt CUDA kernel 时间: {execution_time_ms:.3f} ms")
-'''
+
 # 验证正确性（使用原生 PyTorch 循环版本）
 out_sparse_ref = torch.zeros_like(out_sparse_cuda)
 for n in range(num_nonzeros):
@@ -85,4 +86,7 @@ for n in range(num_nonzeros):
     d = indices[3, n].item()
     out_sparse_ref[:, :, indices[0, n], indices[1, n], indices[2, n]] += a_val * B[:, :, d]
 
+diff_mask = out_sparse_ref != out_sparse_cuda
+num_diff = diff_mask.sum().item()
+print(f"不同元素的个数：{num_diff}")
 print("最大误差:", (out_sparse_ref - out_sparse_cuda).abs().max().item())
